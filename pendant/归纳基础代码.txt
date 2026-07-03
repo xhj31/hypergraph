@@ -1,0 +1,902 @@
+from itertools import combinations, permutations
+from ortools.sat.python import cp_model
+import argparse
+import math
+import time
+import threading
+import os
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+# ============================================================
+# 基础工具
+# ============================================================
+
+def fmt_time(sec):
+    sec = int(sec)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+
+    if h > 0:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m > 0:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def visible_cpu_count():
+    """
+    当前 Python 进程可使用的 CPU 核数。
+    在 Slurm/cgroup 环境下，os.sched_getaffinity(0) 通常比 os.cpu_count() 更准确。
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except Exception:
+        return os.cpu_count()
+
+
+def get_cpu_status_text(proc=None):
+    """
+    返回当前进程 CPU 使用情况。
+
+    psutil 的进程 CPU 使用率可以超过 100%。
+    例如：
+        3200% 约等于 32 个 CPU 核满载。
+    """
+    visible = os.cpu_count()
+    affinity = visible_cpu_count()
+
+    if psutil is None:
+        return (
+            f"CPU状态：系统可见CPU={visible}，当前进程可用CPU={affinity}，"
+            f"当前CPU占用=未知；请先 pip install psutil"
+        )
+
+    if proc is None:
+        proc = psutil.Process(os.getpid())
+
+    try:
+        cpu_percent = proc.cpu_percent(interval=None)
+        used_cores = cpu_percent / 100.0
+        num_threads = proc.num_threads()
+
+        return (
+            f"CPU状态：系统可见CPU={visible}，当前进程可用CPU={affinity}，"
+            f"进程线程数={num_threads}，"
+            f"当前CPU占用={cpu_percent:.1f}%，约等于{used_cores:.2f}个核心"
+        )
+    except Exception as e:
+        return (
+            f"CPU状态：系统可见CPU={visible}，当前进程可用CPU={affinity}，"
+            f"读取当前CPU占用失败：{e}"
+        )
+
+
+def C(n, r):
+    if r < 0 or r > n:
+        return 0
+    return math.comb(n, r)
+
+
+def build_edges(n):
+    """
+    K_n^3 的全部 3-边。
+    顶点编号为 0,1,...,n-1。
+    """
+    edges = list(combinations(range(n), 3))
+    eid = {e: i for i, e in enumerate(edges)}
+    return edges, eid
+
+
+def e_id(eid, a, b, c):
+    return eid[tuple(sorted((a, b, c)))]
+
+
+def pair_partitions(items):
+    """
+    把偶数个元素划分成无序二元组。
+
+    例如 4 个点：
+        {1,2,3,4}
+    划分为：
+        (12)(34), (13)(24), (14)(23)
+    """
+    items = tuple(items)
+
+    if not items:
+        yield ()
+        return
+
+    first = items[0]
+
+    for i in range(1, len(items)):
+        second = items[i]
+        rest = items[1:i] + items[i + 1:]
+
+        for part in pair_partitions(rest):
+            yield ((first, second),) + part
+
+
+# ============================================================
+# 目标结构 H = 线性 C3 + 悬挂边
+# ============================================================
+
+def generate_loose_c3s(n, eid):
+    """
+    生成所有 3-一致线性 C3。
+
+    形式为：
+        {a,b,x}, {b,c,y}, {c,a,z}
+
+    其中 a,b,c 是三个交点；
+    x,y,z 是每条边额外加的点。
+    """
+    for six in combinations(range(n), 6):
+        for core in combinations(six, 3):
+            a, b, c = core
+            private = [v for v in six if v not in core]
+
+            for x, y, z in permutations(private):
+                e1 = e_id(eid, a, b, x)
+                e2 = e_id(eid, b, c, y)
+                e3 = e_id(eid, c, a, z)
+
+                yield tuple(sorted((e1, e2, e3))), tuple(sorted(six))
+
+
+def generate_target_H(n, eid):
+    """
+    生成所有目标结构 H：
+
+        线性 C3 + 一条悬挂边
+
+    线性 C3 为：
+        {a,b,x}, {b,c,y}, {c,a,z}
+
+    悬挂边为：
+        {v,u,w}
+
+    其中 v 是 C3 的 6 个顶点之一；
+    u,w 是 C3 外面的两个新点。
+    """
+    vertices = set(range(n))
+
+    for tri_edges, six_vertices in generate_loose_c3s(n, eid):
+        six_set = set(six_vertices)
+        outside = sorted(vertices - six_set)
+
+        for v in six_vertices:
+            for u, w in combinations(outside, 2):
+                p = e_id(eid, v, u, w)
+                H = tuple(sorted(tri_edges + (p,)))
+                yield H
+
+
+# ============================================================
+# 引理结构 1：线性 S4
+# ============================================================
+
+def generate_S4(n, eid):
+    """
+    生成所有 3-一致线性 S4。
+
+    形式为：
+        {v,a1,b1},
+        {v,a2,b2},
+        {v,a3,b3},
+        {v,a4,b4}
+
+    四条边只交于同一个中心点 v；
+    其他 8 个点两两不同。
+    """
+    for center in range(n):
+        others = [x for x in range(n) if x != center]
+
+        for eight in combinations(others, 8):
+            for part in pair_partitions(eight):
+                H = []
+                for a, b in part:
+                    H.append(e_id(eid, center, a, b))
+                yield tuple(sorted(H))
+
+
+# ============================================================
+# 引理结构 2：线性 C4
+# ============================================================
+
+def canonical_4cycles(core):
+    """
+    给定 4 个 core 顶点，生成无向 4-圈的规范代表。
+
+    对 4 个顶点，一共有 3 个不同的无向 4-圈。
+    """
+    core = tuple(sorted(core))
+    start = core[0]
+
+    for perm in permutations(core[1:]):
+        cyc = (start,) + perm
+
+        # 去掉反向重复：
+        # (v0,v1,v2,v3) 与 (v0,v3,v2,v1) 是同一个无向圈。
+        if cyc[1] < cyc[-1]:
+            yield cyc
+
+
+def generate_C4(n, eid):
+    """
+    生成所有 3-一致线性 C4。
+
+    形式为：
+        {v1,v2,x1},
+        {v2,v3,x2},
+        {v3,v4,x3},
+        {v4,v1,x4}
+
+    相邻边交于一个点，非相邻边不相交。
+    """
+    for eight in combinations(range(n), 8):
+        for core in combinations(eight, 4):
+            private = [v for v in eight if v not in core]
+
+            for cyc in canonical_4cycles(core):
+                v0, v1, v2, v3 = cyc
+
+                core_pairs = [
+                    (v0, v1),
+                    (v1, v2),
+                    (v2, v3),
+                    (v3, v0),
+                ]
+
+                for x0, x1, x2, x3 in permutations(private):
+                    xs = [x0, x1, x2, x3]
+
+                    H = []
+                    for i in range(4):
+                        a, b = core_pairs[i]
+                        x = xs[i]
+                        H.append(e_id(eid, a, b, x))
+
+                    yield tuple(sorted(H))
+
+
+# ============================================================
+# 理论数量，用于检查生成器
+# ============================================================
+
+def expected_target_count(n):
+    """
+    H = C3 + 悬挂边 的数量：
+
+    选 6 个点做 C3；
+    选 3 个 core 点；
+    三个 private 点分配给三条边；
+    选悬挂点；
+    选两个外部点。
+    """
+    return C(n, 6) * C(6, 3) * math.factorial(3) * 6 * C(n - 6, 2)
+
+
+def expected_S4_count(n):
+    """
+    S4 数量：
+
+    选中心点；
+    从剩余点中选 8 个；
+    把 8 个点配成 4 对。
+    """
+    return n * C(n - 1, 8) * 105
+
+
+def expected_C4_count(n):
+    """
+    C4 数量：
+
+    选 8 个点；
+    选 4 个 core 点；
+    core 上有 3 个无向 4-圈；
+    4 个 private 点分配到 4 条边。
+    """
+    return C(n, 8) * C(8, 4) * 3 * math.factorial(4)
+
+
+# ============================================================
+# CP-SAT 模型工具
+# ============================================================
+
+def get_same_lit(same, i, j):
+    if i > j:
+        i, j = j, i
+    return same[i][j]
+
+
+def add_no_rainbow_constraints(
+    model,
+    configs,
+    same,
+    label,
+    expected=None,
+    progress_every=50000,
+):
+    """
+    对每个 4 边结构 F={e1,e2,e3,e4}，加入：
+
+        F 不是彩虹
+
+    等价于：
+
+        至少有一对边颜色相同。
+
+    即：
+        same(e1,e2) OR same(e1,e3) OR ... OR same(e3,e4)
+    """
+    count = 0
+    start = time.time()
+
+    print()
+    print(f"[{label}] 开始加入 no-rainbow 约束 ...", flush=True)
+
+    for H in configs:
+        e1, e2, e3, e4 = H
+
+        clause = [
+            get_same_lit(same, e1, e2),
+            get_same_lit(same, e1, e3),
+            get_same_lit(same, e1, e4),
+            get_same_lit(same, e2, e3),
+            get_same_lit(same, e2, e4),
+            get_same_lit(same, e3, e4),
+        ]
+
+        model.AddBoolOr(clause)
+        count += 1
+
+        if progress_every > 0 and count % progress_every == 0:
+            now = time.time()
+            elapsed = now - start
+            rate = count / elapsed if elapsed > 0 else 0
+
+            if expected is not None and rate > 0:
+                pct = 100.0 * count / expected
+                remain = max(expected - count, 0)
+                eta = remain / rate
+
+                print(
+                    f"[{label}] {count:,}/{expected:,} "
+                    f"({pct:.2f}%)，速度 {rate:,.1f} 条/秒，"
+                    f"已用 {fmt_time(elapsed)}，预计剩余 {fmt_time(eta)}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[{label}] 已加入 {count:,} 条约束，"
+                    f"速度 {rate:,.1f} 条/秒，已用 {fmt_time(elapsed)}",
+                    flush=True,
+                )
+
+    elapsed = time.time() - start
+    rate = count / elapsed if elapsed > 0 else 0
+
+    print(
+        f"[{label}] 完成：实际加入 {count:,} 条约束，"
+        f"耗时 {fmt_time(elapsed)}，平均速度 {rate:,.1f} 条/秒",
+        flush=True,
+    )
+
+    if expected is not None:
+        print(f"[{label}] 理论数量：{expected:,}", flush=True)
+
+        if count != expected:
+            print(
+                f"[警告] {label} 实际数量与理论数量不一致，请检查生成器。",
+                flush=True,
+            )
+
+    return count
+
+
+# ============================================================
+# 建立模型
+# ============================================================
+
+def build_model(
+    n,
+    colors_num,
+    use_target=True,
+    use_S4=True,
+    use_C4=True,
+    progress_every=50000,
+):
+    edges, eid = build_edges(n)
+    m = len(edges)
+
+    print()
+    print("=" * 70, flush=True)
+    print("建立 CP-SAT 模型", flush=True)
+    print(f"n = {n}", flush=True)
+    print(f"|E(K_n^3)| = C({n},3) = {m}", flush=True)
+    print(f"颜色数 = {colors_num}", flush=True)
+    print(f"加入目标 H 约束: {use_target}", flush=True)
+    print(f"加入 S4 引理约束: {use_S4}", flush=True)
+    print(f"加入 C4 引理约束: {use_C4}", flush=True)
+    print("=" * 70, flush=True)
+
+    print()
+    print("CPU环境：", flush=True)
+    print(f"  os.cpu_count() = {os.cpu_count()}", flush=True)
+    print(f"  当前进程可用CPU核数 = {visible_cpu_count()}", flush=True)
+
+    print()
+    print("理论结构数量：", flush=True)
+    print(f"  S4 数量 = {expected_S4_count(n):,}", flush=True)
+    print(f"  C4 数量 = {expected_C4_count(n):,}", flush=True)
+    print(f"  H  数量 = {expected_target_count(n):,}", flush=True)
+
+    model = cp_model.CpModel()
+
+    # color[i] 表示第 i 条 3-边的颜色，颜色编号为 0,...,colors_num-1
+    color = [
+        model.NewIntVar(0, colors_num - 1, f"c_{i}")
+        for i in range(m)
+    ]
+
+    # ------------------------------------------------------------
+    # 颜色对称性破除：value precedence
+    #
+    # 任意一个使用 colors_num 种颜色的染色，都可以重新命名颜色：
+    # 第一次出现的颜色叫 0；
+    # 第二个新颜色叫 1；
+    # 依此类推。
+    #
+    # 因此可以强制：
+    #   color[0] = 0
+    #   color[i] <= prefix_max[i-1] + 1
+    #
+    # 最后要求 prefix_max[-1] = colors_num - 1，
+    # 即真正使用了 colors_num 种颜色。
+    # ------------------------------------------------------------
+
+    print()
+    print("加入颜色对称性破除约束 ...", flush=True)
+
+    model.Add(color[0] == 0)
+
+    prefix_max = []
+
+    p0 = model.NewIntVar(0, colors_num - 1, "prefix_max_0")
+    model.Add(p0 == color[0])
+    prefix_max.append(p0)
+
+    for i in range(1, m):
+        model.Add(color[i] <= prefix_max[i - 1] + 1)
+        model.Add(color[i] <= min(i, colors_num - 1))
+
+        pi = model.NewIntVar(0, colors_num - 1, f"prefix_max_{i}")
+        model.AddMaxEquality(pi, [prefix_max[i - 1], color[i]])
+        prefix_max.append(pi)
+
+    # 真正使用 colors_num 种颜色
+    model.Add(prefix_max[-1] == colors_num - 1)
+
+    # 加强约束：
+    # 如果剩余边数已经不够引入所有剩余新颜色，则提前剪枝。
+    for i in range(m):
+        lower = colors_num - (m - i)
+        if lower > 0:
+            model.Add(prefix_max[i] >= lower)
+
+    # ------------------------------------------------------------
+    # same[i][j] = True 当且仅当 color[i] == color[j]
+    # ------------------------------------------------------------
+
+    print("建立 same[i,j] 颜色相等变量 ...", flush=True)
+
+    same = [[None for _ in range(m)] for _ in range(m)]
+
+    same_start = time.time()
+    same_count = 0
+    total_same = m * (m - 1) // 2
+
+    for i in range(m):
+        for j in range(i + 1, m):
+            b = model.NewBoolVar(f"same_{i}_{j}")
+
+            model.Add(color[i] == color[j]).OnlyEnforceIf(b)
+            model.Add(color[i] != color[j]).OnlyEnforceIf(b.Not())
+
+            same[i][j] = b
+            same_count += 1
+
+        if i % 10 == 0 or i == m - 1:
+            elapsed = time.time() - same_start
+            rate = same_count / elapsed if elapsed > 0 else 0
+            pct = 100.0 * same_count / total_same
+
+            print(
+                f"[same变量] {same_count:,}/{total_same:,} "
+                f"({pct:.2f}%)，速度 {rate:,.1f} 个/秒",
+                flush=True,
+            )
+
+    # ------------------------------------------------------------
+    # 加入 no-rainbow 约束
+    # ------------------------------------------------------------
+
+    total_constraints = 0
+
+    if use_S4:
+        total_constraints += add_no_rainbow_constraints(
+            model=model,
+            configs=generate_S4(n, eid),
+            same=same,
+            label="S4 引理约束",
+            expected=expected_S4_count(n),
+            progress_every=progress_every,
+        )
+
+    if use_C4:
+        total_constraints += add_no_rainbow_constraints(
+            model=model,
+            configs=generate_C4(n, eid),
+            same=same,
+            label="C4 引理约束",
+            expected=expected_C4_count(n),
+            progress_every=progress_every,
+        )
+
+    if use_target:
+        total_constraints += add_no_rainbow_constraints(
+            model=model,
+            configs=generate_target_H(n, eid),
+            same=same,
+            label="目标 H 约束",
+            expected=expected_target_count(n),
+            progress_every=progress_every,
+        )
+
+    print()
+    print(f"总 no-rainbow 约束数 = {total_constraints:,}", flush=True)
+
+    # 搜索策略：按边顺序赋值，优先尝试小颜色
+    model.AddDecisionStrategy(
+        color,
+        cp_model.CHOOSE_FIRST,
+        cp_model.SELECT_MIN_VALUE,
+    )
+
+    return model, edges, color
+
+
+# ============================================================
+# 求解一次
+# ============================================================
+
+def solve_once(
+    n,
+    colors_num,
+    workers,
+    time_limit,
+    use_target,
+    use_S4,
+    use_C4,
+    log=False,
+    save_solution=None,
+    progress_every=50000,
+    heartbeat=60,
+):
+    total_start = time.time()
+
+    model, edges, color = build_model(
+        n=n,
+        colors_num=colors_num,
+        use_target=use_target,
+        use_S4=use_S4,
+        use_C4=use_C4,
+        progress_every=progress_every,
+    )
+
+    solver = cp_model.CpSolver()
+
+    solver.parameters.num_search_workers = workers
+    solver.parameters.cp_model_presolve = True
+    solver.parameters.symmetry_level = 2
+    solver.parameters.linearization_level = 0
+
+    # 输出 CP-SAT 内部搜索日志
+    solver.parameters.log_search_progress = log
+
+    try:
+        solver.parameters.log_to_stdout = True
+    except Exception:
+        pass
+
+    try:
+        solver.log_callback = lambda s: print(s, end="", flush=True)
+    except Exception:
+        pass
+
+    if time_limit > 0:
+        solver.parameters.max_time_in_seconds = time_limit
+
+    print()
+    print("=" * 70, flush=True)
+    print("开始求解 ...", flush=True)
+    print(f"workers = {workers}", flush=True)
+    print(f"当前进程可用CPU核数 = {visible_cpu_count()}", flush=True)
+
+    if workers > visible_cpu_count():
+        print(
+            f"[提醒] workers={workers} 大于当前进程可用CPU核数 {visible_cpu_count()}，"
+            f"实际可能无法使用这么多核心。",
+            flush=True,
+        )
+
+    if time_limit > 0:
+        print(f"time limit = {time_limit} 秒", flush=True)
+    else:
+        print("time limit = 不限制", flush=True)
+
+    print("=" * 70, flush=True)
+
+    solve_start = time.time()
+    stop_heartbeat = threading.Event()
+
+    # 初始化 psutil 进程监控
+    proc = None
+    if psutil is not None:
+        proc = psutil.Process(os.getpid())
+        proc.cpu_percent(interval=None)
+
+    print(get_cpu_status_text(proc), flush=True)
+
+    def heartbeat_func():
+        while not stop_heartbeat.wait(heartbeat):
+            elapsed = time.time() - solve_start
+
+            print(
+                f"[求解心跳] 已求解 {fmt_time(elapsed)}，"
+                f"workers={workers}，CP-SAT 仍在搜索中 ...",
+                flush=True,
+            )
+
+            print(
+                "[求解心跳] " + get_cpu_status_text(proc),
+                flush=True,
+            )
+
+    if heartbeat > 0:
+        hb_thread = threading.Thread(target=heartbeat_func, daemon=True)
+        hb_thread.start()
+
+    result = solver.Solve(model)
+
+    stop_heartbeat.set()
+
+    solve_elapsed = time.time() - solve_start
+    total_elapsed = time.time() - total_start
+
+    print()
+    print("=" * 70, flush=True)
+    print("求解状态:", solver.StatusName(result), flush=True)
+    print(f"求解耗时: {fmt_time(solve_elapsed)}", flush=True)
+    print(f"总耗时: {fmt_time(total_elapsed)}", flush=True)
+    print("最终" + get_cpu_status_text(proc), flush=True)
+    print("=" * 70, flush=True)
+
+    try:
+        print(solver.ResponseStats(), flush=True)
+    except Exception:
+        pass
+
+    if result == cp_model.INFEASIBLE:
+        print()
+        print("当前模型不可满足。", flush=True)
+
+    elif result in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+        print()
+        print("找到一个满足当前约束的染色。", flush=True)
+
+        if save_solution is not None:
+            color_classes = [[] for _ in range(colors_num)]
+
+            for i, e in enumerate(edges):
+                col = solver.Value(color[i])
+                color_classes[col].append(e)
+
+            with open(save_solution, "w", encoding="utf-8") as f:
+                for col, cls in enumerate(color_classes):
+                    f.write(f"颜色 {col}: {cls}\n")
+
+            print(f"染色方案已保存到: {save_solution}", flush=True)
+
+    else:
+        print()
+        print("求解器在当前限制下未给出结论。", flush=True)
+
+    return result
+
+
+# ============================================================
+# 主函数
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--n", type=int, default=10)
+    parser.add_argument("--colors", type=int, default=18)
+    parser.add_argument("--workers", type=int, default=32)
+    parser.add_argument("--time-limit", type=float, default=0)
+
+    parser.add_argument(
+        "--mode",
+        choices=["lemmas", "target", "all", "staged"],
+        default="staged",
+        help="""
+        lemmas: 只禁止彩虹 S4 和彩虹 C4；
+        target: 只禁止目标 H；
+        all: 同时禁止 H, S4, C4；
+        staged: 先跑 lemmas，若不能直接证明，再跑 all。
+        """,
+    )
+
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="是否显示 CP-SAT 内部搜索日志。",
+    )
+
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=50000,
+        help="建模阶段每加入多少条 no-rainbow 约束输出一次进度。",
+    )
+
+    parser.add_argument(
+        "--heartbeat",
+        type=int,
+        default=60,
+        help="求解阶段每隔多少秒输出一次心跳。设为 0 则关闭。",
+    )
+
+    parser.add_argument(
+        "--save-solution",
+        type=str,
+        default=None,
+        help="若找到可行染色，把颜色类保存到指定文件。",
+    )
+
+    args = parser.parse_args()
+
+    print()
+    print("参数设置：", flush=True)
+    print(f"  n = {args.n}", flush=True)
+    print(f"  colors = {args.colors}", flush=True)
+    print(f"  workers = {args.workers}", flush=True)
+    print(f"  mode = {args.mode}", flush=True)
+    print(f"  log = {args.log}", flush=True)
+    print(f"  progress_every = {args.progress_every}", flush=True)
+    print(f"  heartbeat = {args.heartbeat}", flush=True)
+    print(f"  os.cpu_count() = {os.cpu_count()}", flush=True)
+    print(f"  当前进程可用CPU核数 = {visible_cpu_count()}", flush=True)
+
+    if args.mode == "lemmas":
+        result = solve_once(
+            n=args.n,
+            colors_num=args.colors,
+            workers=args.workers,
+            time_limit=args.time_limit,
+            use_target=False,
+            use_S4=True,
+            use_C4=True,
+            log=args.log,
+            save_solution=args.save_solution,
+            progress_every=args.progress_every,
+            heartbeat=args.heartbeat,
+        )
+
+        if result == cp_model.INFEASIBLE:
+            print()
+            print("结论：任意 18 色染色必含彩虹 S4 或彩虹 C4。", flush=True)
+            print("由你的两个引理，必含目标彩虹结构 H。", flush=True)
+            print("因此 n=10 的归纳基础成立。", flush=True)
+
+    elif args.mode == "target":
+        result = solve_once(
+            n=args.n,
+            colors_num=args.colors,
+            workers=args.workers,
+            time_limit=args.time_limit,
+            use_target=True,
+            use_S4=False,
+            use_C4=False,
+            log=args.log,
+            save_solution=args.save_solution,
+            progress_every=args.progress_every,
+            heartbeat=args.heartbeat,
+        )
+
+        if result == cp_model.INFEASIBLE:
+            print()
+            print("结论：不存在 18 色无彩虹 H 的染色。", flush=True)
+            print("因此 n=10 的归纳基础成立。", flush=True)
+
+    elif args.mode == "all":
+        result = solve_once(
+            n=args.n,
+            colors_num=args.colors,
+            workers=args.workers,
+            time_limit=args.time_limit,
+            use_target=True,
+            use_S4=True,
+            use_C4=True,
+            log=args.log,
+            save_solution=args.save_solution,
+            progress_every=args.progress_every,
+            heartbeat=args.heartbeat,
+        )
+
+        if result == cp_model.INFEASIBLE:
+            print()
+            print("结论：不存在 18 色无彩虹 H 的染色。", flush=True)
+            print("因此 n=10 的归纳基础成立。", flush=True)
+
+    elif args.mode == "staged":
+        print()
+        print("第一阶段：只使用两个引理，即禁止彩虹 S4 和彩虹 C4。", flush=True)
+
+        result1 = solve_once(
+            n=args.n,
+            colors_num=args.colors,
+            workers=args.workers,
+            time_limit=args.time_limit,
+            use_target=False,
+            use_S4=True,
+            use_C4=True,
+            log=args.log,
+            save_solution=None,
+            progress_every=args.progress_every,
+            heartbeat=args.heartbeat,
+        )
+
+        if result1 == cp_model.INFEASIBLE:
+            print()
+            print("第一阶段已经不可满足。", flush=True)
+            print("结论：任意 18 色染色必含彩虹 S4 或彩虹 C4。", flush=True)
+            print("由你的两个引理，必含目标彩虹结构 H。", flush=True)
+            print("因此 n=10 的归纳基础成立。", flush=True)
+            return
+
+        print()
+        print("第一阶段没有直接证明。", flush=True)
+        print("第二阶段：同时禁止目标 H、彩虹 S4、彩虹 C4。", flush=True)
+
+        result2 = solve_once(
+            n=args.n,
+            colors_num=args.colors,
+            workers=args.workers,
+            time_limit=args.time_limit,
+            use_target=True,
+            use_S4=True,
+            use_C4=True,
+            log=args.log,
+            save_solution=args.save_solution,
+            progress_every=args.progress_every,
+            heartbeat=args.heartbeat,
+        )
+
+        if result2 == cp_model.INFEASIBLE:
+            print()
+            print("第二阶段不可满足。", flush=True)
+            print("结论：不存在 18 色无彩虹 H 的染色。", flush=True)
+            print("因此 n=10 的归纳基础成立。", flush=True)
+
+
+if __name__ == "__main__":
+    main()
